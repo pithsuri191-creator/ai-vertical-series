@@ -34,7 +34,6 @@ st.markdown("""
 # ---------------------------------------------------------
 # 2. Session State Initialization
 # ---------------------------------------------------------
-# ระบบบัญชีผู้ใช้มาตรฐาน (Default Accounts)
 USER_DATABASE = {
     "admin": {"password": "123", "role": "Admin", "name": "System Administrator"},
     "creator": {"password": "123", "role": "Creator", "name": "Content Creator 01"}
@@ -54,12 +53,6 @@ if 'jobs_list' not in st.session_state:
             "genre": "ดราม่า/แก้แค้น", "status": "Completed", "progress": 100, 
             "step_script": "Done", "step_audio": "Done", "step_visual": "Done", "step_assembly": "Done",
             "created": "2026-10-21 15:30", "output": "storage/outputs/job901.mp4"
-        },
-        {
-            "id": "JOB-902", "user": "creator", "title": "ย้อนเวลามาเป็นฮูหยินยอดอัจฉริยะ", 
-            "genre": "แฟนตาซี/ย้อนยุค", "status": "Processing", "progress": 65, 
-            "step_script": "Done", "step_audio": "Done", "step_visual": "Processing", "step_assembly": "Pending",
-            "created": "2026-10-21 16:10", "output": None
         }
     ]
 
@@ -84,12 +77,10 @@ def get_badge(status):
     return '<span class="badge badge-pending">⏳ รอคิวประมวลผล</span>'
 
 def generate_ai_story_prompt(api_key, genre):
-    """เรียกใช้งาน Gemini API พร้อมระบบเลือกโมเดลสำรอง (Fallback mechanism)"""
     if not api_key:
         return False, "ยังไม่ได้กรอกหรือตั้งค่า Gemini API Key"
     
     genai.configure(api_key=api_key)
-    # ลำดับชื่อโมเดลที่รองรับการสร้างข้อความ
     model_candidates = ['gemini-1.5-flash-latest', 'gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
     
     for model_name in model_candidates:
@@ -120,13 +111,13 @@ if not st.session_state.authenticated:
             st.session_state.authenticated = True
             st.session_state.current_user = login_user
             st.session_state.current_role = USER_DATABASE[login_user]["role"]
-            st.session_state.system_logs.insert(0, f"[AUTH] {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - User '{login_user}' logged in successfully as {USER_DATABASE[login_user]['role']}.")
+            st.session_state.system_logs.insert(0, f"[AUTH] {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - User '{login_user}' logged in successfully.")
             st.success("เข้าสู่ระบบสำเร็จ!")
             st.rerun()
         else:
             st.error("ชื่อผู้ใช้งานหรือรหัสผ่านไม่ถูกต้อง")
             
-    st.info("💡 **ข้อมูลการทดสอบเข้าสู่ระบบ:**\n- **Admin:** `admin` / `123`\n- **Creator:** `creator` / `123`")
+    st.info("💡 **ข้อมูลทดสอบ:**\n- **Admin:** `admin` / `123`\n- **Creator:** `creator` / `123`")
     st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
 
@@ -145,7 +136,7 @@ with st.sidebar:
         
     st.divider()
 
-    # 🔒 สิทธิ์ Admin เท่านั้นที่สามารถตั้งค่า API Key ของระบบได้
+    # 🔒 สิทธิ์ Admin ควบคุม API Key
     if st.session_state.current_role == "Admin":
         st.subheader("🔑 API Key Control (Admin Only)")
         admin_key_input = st.text_input(
@@ -156,26 +147,33 @@ with st.sidebar:
         )
         if admin_key_input != st.session_state.gemini_api_key:
             st.session_state.gemini_api_key = admin_key_input
-            st.success("บันทึก API Key ใหม่เรียบร้อยแล้ว!")
+            st.success("บันทึก API Key สำเร็จ!")
             st.rerun()
         st.divider()
 
-    # ฟอร์มสั่งสร้างงานซีรีส์
+    # ตรวจสอบสถานะการเชื่อมต่อ AI ล่วงหน้า
+    api_ready = bool(st.session_state.gemini_api_key)
+
     st.subheader("➕ สั่งสร้างซีรีส์ตอนใหม่")
-    with st.form("create_form"):
-        title = st.text_input("ชื่อตอน", placeholder="เช่น รักซ่อนกล ตอนที่ 1")
-        genre = st.selectbox("แนวซีรีส์", ["ดราม่า/แก้แค้น", "โรแมนติก/คอมเมดี้", "แฟนตาซี/ย้อนยุค", "ระทึกขวัญ"])
-        
-        generate_ai_prompt_btn = st.form_submit_button("✨ ให้ AI พล็อตเรื่องย่อให้อัตโนมัติ")
-        if generate_ai_prompt_btn:
-            with st.spinner("AI กำลังคิดพล็อตเรื่อง..."):
+    
+    # แยกส่วนการสั่ง AI พล็อตเรื่องออกนอกฟอร์มหลัก เพื่อให้ทำงานราบรื่น
+    genre = st.selectbox("แนวซีรีส์", ["ดราม่า/แก้แค้น", "โรแมนติก/คอมเมดี้", "แฟนตาซี/ย้อนยุค", "ระทึกขวัญ"])
+    
+    if st.button("✨ ให้ AI พล็อตเรื่องย่อให้อัตโนมัติ", use_container_width=True):
+        if api_ready:
+            with st.spinner("AI กำลังคิดพล็อตเรื่องแนวตั้ง..."):
                 success, result = generate_ai_story_prompt(st.session_state.gemini_api_key, genre)
                 if success:
                     st.session_state.ai_generated_prompt = result
                     st.success("สร้างพล็อตเรื่องสำเร็จ!")
+                    st.rerun()
                 else:
                     st.error(result)
+        else:
+            st.warning("กรุณาให้ Admin ตั้งค่า Gemini API Key ก่อนใช้งาน AI")
 
+    with st.form("create_job_form"):
+        title = st.text_input("ชื่อตอน", placeholder="เช่น รักซ่อนกล ตอนที่ 1")
         prompt = st.text_area("พล็อตเรื่องย่อ (Prompt)", value=st.session_state.ai_generated_prompt, placeholder="รายละเอียดพล็อตเรื่อง...")
         
         submitted = st.form_submit_button("🚀 ส่งงานเข้าคิวคลาวด์", use_container_width=True)
@@ -203,20 +201,17 @@ with st.sidebar:
     st.divider()
     st.subheader("🔌 สถานะระบบ (System Health)")
     st.markdown("- **Streamlit Cloud:** <span style='color:#3FB950;'>● ออนไลน์</span>", unsafe_allow_html=True)
-    if st.session_state.gemini_api_key:
+    if api_ready:
         st.markdown("- **Gemini AI Service:** <span style='color:#3FB950;'>● พร้อมใช้งาน</span>", unsafe_allow_html=True)
     else:
         st.markdown("- **Gemini AI Service:** <span style='color:#F85149;'>● รอการตั้งค่า API Key</span>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# 6. Main Dashboard Area (แยกตามสิทธิ์ผู้ใช้งาน)
+# 6. Main Dashboard Area
 # ---------------------------------------------------------
 jobs = st.session_state.jobs_list
 
 if st.session_state.current_role == "Admin":
-    # ==========================================
-    # 👑 ADMIN CONTROL DASHBOARD
-    # ==========================================
     st.title("🛡️ Admin Operations & Control Center")
     st.markdown("ศูนย์บริหารและควบคุมคิวงานทั้งหมด ตรวจสอบ Performance และ System Logs แบบเรียลไทม์")
 
@@ -248,7 +243,7 @@ if st.session_state.current_role == "Admin":
                     st.write("")
                     if st.button(f"🗑️ ลบงาน", key=f"admin_del_{j['id']}_{idx}"):
                         st.session_state.jobs_list.remove(j)
-                        st.session_state.system_logs.insert(0, f"[DELETE] {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Job {j['id']} removed by Admin.")
+                        st.session_state.system_logs.insert(0, f"[DELETE] Job {j['id']} removed by Admin.")
                         st.success(f"ลบงาน {j['id']} เรียบร้อย")
                         st.rerun()
                 st.markdown("---")
@@ -267,13 +262,9 @@ if st.session_state.current_role == "Admin":
             st.code(log, language="text")
 
 else:
-    # ==========================================
-    # 🎬 CREATOR PRODUCTION DASHBOARD
-    # ==========================================
     st.title("📊 Creator Production & Pipeline Dashboard")
     st.markdown("แดชบอร์ดส่วนตัวสำหรับติดตามสถานะการสร้างวิดีโอซีรีส์แนวตั้ง")
 
-    # แสดงเฉพาะงานของผู้ใช้ที่เข้าสู่ระบบ
     user_jobs = [j for j in jobs if j['user'] == st.session_state.current_user]
     total_u = len(user_jobs)
     completed_u = len([j for j in user_jobs if j['status'] == 'Completed'])
