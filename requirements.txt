@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+google-generativeai
+firebase-admin
+edge-tts
+requests
+pydantic
