@@ -28,9 +28,12 @@ import json
 import os
 import re
 import secrets as pysecrets
+import shutil
+import subprocess
 import threading
 import time
 import uuid
+import wave
 
 import pandas as pd
 import streamlit as st
@@ -50,7 +53,7 @@ except Exception:
 # ---------------------------------------------------------
 # 0. Constants
 # ---------------------------------------------------------
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 TZ = dt.timezone(dt.timedelta(hours=7))
 DATA_DIR = os.environ.get("APP_DATA_DIR", "storage")
 JOBS_FILE = os.path.join(DATA_DIR, "jobs.json")
@@ -67,9 +70,14 @@ STAGES = [
     ("visual", "3. ภาพ/วิดีโอ"),
     ("assembly", "4. ตัดต่อรวม"),
 ]
-# ขั้นตอนที่ยังเป็นการจำลอง (เสียบบริการจริง เช่น TTS / วิดีโอ ได้ที่ฟังก์ชัน worker_tick)
-SIM_DURATION = {"audio": 6, "visual": 10, "assembly": 6}
-STALE_SECONDS = 180
+OUT_DIR = os.path.join(DATA_DIR, "outputs")
+os.makedirs(OUT_DIR, exist_ok=True)
+VOICES = ["Kore", "Puck", "Charon", "Aoede", "Fenrir", "Leda", "Zephyr", "Orus"]
+TTS_FALLBACK = ["gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"]
+IMAGE_FALLBACK = ["gemini-2.5-flash-image", "gemini-2.5-flash-image-preview"]
+VIDEO_W, VIDEO_H, VIDEO_FPS = 720, 1280, 30
+MAX_CONCURRENT_STAGES = 2
+STALE_SECONDS = 900  # ขั้นที่ค้างเกินเวลานี้ (เช่น เซิร์ฟเวอร์รีสตาร์ต) จะถูกรีเซ็ตให้ทำใหม่
 MAX_ACTIVE_PER_USER = 5
 MAX_LOGS = 500
 LOGIN_MAX_FAILS = 5
@@ -109,15 +117,21 @@ st.markdown(
 # ---------------------------------------------------------
 # 1. Shared resources, storage, utilities
 # ---------------------------------------------------------
-@st.cache_resource
+def _global(name, factory):
+    """ออบเจ็กต์ร่วมทั้งโปรเซส (รอดการรันสคริปต์ซ้ำ และใช้ได้จากเธรดเบื้องหลังโดยไม่ต้องมี Streamlit context)"""
+    key = f"_aistudio_{name}"
+    if not hasattr(threading, key):
+        setattr(threading, key, factory())
+    return getattr(threading, key)
+
+
 def get_lock():
-    return threading.RLock()
+    return _global("lock", threading.RLock)
 
 
-@st.cache_resource
 def shared_state():
     """หน่วยความจำร่วมทุก session (ไม่เขียนลงดิสก์): API key ที่แอดมินตั้งตอนรัน, โควตา, ตัวนับล็อกอินผิด"""
-    return {"api_key": "", "model": "", "calls": {}, "fails": {}}
+    return _global("state", lambda: {"api_key": "", "model": "", "voice": VOICES[0], "calls": {}, "fails": {}})
 
 
 def secret(name, default=""):
@@ -319,24 +333,21 @@ def _model_rank(name):
     return None
 
 
-def discover_models(force=False):
-    """ถามรายชื่อโมเดลที่ API Key นี้ใช้ generateContent ได้จริง (แคช 10 นาที)
-    คืนลิสต์เรียงตามความเหมาะสม; ถ้าถามไม่ได้คืนลิสต์ว่าง"""
+def _raw_models(force=False):
+    """รายชื่อโมเดลทั้งหมดที่ API Key นี้เห็น พร้อมความสามารถ: [(ชื่อ, [actions])] (แคช 10 นาที)"""
     ss = shared_state()
     key = get_api_key()
-    cache = ss.get("models_cache")
+    cache = ss.get("raw_cache")
     if not force and cache and cache["key"] == key and time.time() - cache["ts"] < 600:
-        return cache["models"]
-    names = []
+        return cache["items"]
+    items = []
     if key and _SDK is not None:
         try:
             if _SDK == "new":
                 client = _genai_new.Client(api_key=key)
                 try:
                     for mdl in client.models.list():
-                        acts = getattr(mdl, "supported_actions", None) or []
-                        if not acts or "generateContent" in acts:
-                            names.append(mdl.name)
+                        items.append((mdl.name.replace("models/", ""), list(getattr(mdl, "supported_actions", None) or [])))
                 finally:
                     try:
                         client.close()
@@ -345,15 +356,37 @@ def discover_models(force=False):
             else:
                 _genai_old.configure(api_key=key)
                 for mdl in _genai_old.list_models():
-                    if "generateContent" in getattr(mdl, "supported_generation_methods", []):
-                        names.append(mdl.name)
+                    items.append((mdl.name.replace("models/", ""),
+                                  list(getattr(mdl, "supported_generation_methods", []) or [])))
         except Exception:
-            names = []
-    ranked = sorted({n.replace("models/", "") for n in names if _model_rank(n) is not None},
-                    key=lambda n: (_model_rank(n), [-ord(c) for c in n]))
-    if ranked:  # ไม่แคชผลว่าง เพื่อให้ลองถามใหม่ครั้งถัดไป
-        ss["models_cache"] = {"key": key, "ts": time.time(), "models": ranked}
-    return ranked
+            items = []
+    if items:  # ไม่แคชผลว่าง เพื่อให้ลองถามใหม่ครั้งถัดไป
+        ss["raw_cache"] = {"key": key, "ts": time.time(), "items": items}
+    return items
+
+
+def discover_models(force=False):
+    """โมเดลข้อความที่ API Key นี้ใช้ generateContent ได้จริง เรียงตามความเหมาะสม (ว่างถ้าถามไม่ได้)"""
+    names = [n for n, acts in _raw_models(force) if (not acts or "generateContent" in acts)]
+    return sorted({n for n in names if _model_rank(n) is not None},
+                  key=lambda n: (_model_rank(n), [-ord(c) for c in n]))
+
+
+def _media_rank(n):
+    return (0 if "flash" in n else 1, 1 if "preview" in n else 0, [-ord(c) for c in n])
+
+
+def tts_models():
+    names = [n for n, acts in _raw_models() if "tts" in n and n.startswith("gemini")]
+    return sorted(set(names), key=_media_rank) or list(TTS_FALLBACK)
+
+
+def image_models():
+    items = _raw_models()
+    gem = [n for n, acts in items if n.startswith("gemini") and "image" in n and (not acts or "generateContent" in acts)]
+    imagen = [n for n, acts in items if n.startswith("imagen") and "fast" not in n]
+    out = sorted(set(gem), key=_media_rank) + sorted(set(imagen), key=_media_rank)
+    return out or list(IMAGE_FALLBACK)
 
 
 def call_gemini(prompt, model=None):
@@ -401,7 +434,7 @@ def call_gemini(prompt, model=None):
                     not_found += 1
                 break
     if not_found and not_found >= len(models):
-        shared_state().pop("models_cache", None)
+        shared_state().pop("raw_cache", None)
         return False, ("ไม่พบโมเดล Gemini ที่ใช้งานได้กับ API Key นี้ (โมเดลอาจถูกยกเลิกแล้ว) "
                        "ลองกด \"รีเฟรชรายชื่อโมเดล\" ในแท็บระบบ หรือสร้าง API Key ใหม่ที่ aistudio.google.com"), None
     return False, f"เรียก Gemini ไม่สำเร็จ: {last}", None
@@ -434,7 +467,8 @@ def new_job(user, title, genre, plot):
         "user": user, "title": title, "genre": genre, "plot": plot,
         "status": "Queued", "progress": 0, "cancelled": False, "error": "",
         "stages": {k: {"state": "Pending", "started": 0, "finished": 0} for k, _ in STAGES},
-        "script_text": "", "model": "", "created": now_str(), "updated": now_str(),
+        "script_text": "", "model": "", "scenes": [], "notes": [], "output": "",
+        "created": now_str(), "updated": now_str(),
     }
     return j
 
@@ -486,15 +520,318 @@ def cancel_job(job_id):
 
 def delete_job(job_id):
     update_jobs(lambda jobs: jobs.__setitem__(slice(None), [j for j in jobs if j["id"] != job_id]))
+    purge_outputs(job_id)
+
+
+# ---------- ผลิตสื่อจริง: storyboard / เสียง / ภาพ / ตัดต่อ ----------
+def job_dir(job_id):
+    d = os.path.join(OUT_DIR, job_id)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def purge_outputs(job_id):
+    shutil.rmtree(os.path.join(OUT_DIR, job_id), ignore_errors=True)
+
+
+def storyboard_prompt(title, script):
+    return (
+        "จากบทซีรีส์สั้นแนวตั้งด้านล่าง ให้แบ่งเป็น 4 ฉาก (ไม่เกิน 5) สำหรับทำวิดีโอรวม 45-75 วินาที\n"
+        "ตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่นหรือ markdown รูปแบบ:\n"
+        '{"scenes":[{"narration":"คำพากย์ภาษาไทยของฉากนี้ 1-3 ประโยค ไม่เกิน 45 คำ ไม่ใส่ชื่อตัวละครนำหน้า",'
+        '"visual":"English description of one cinematic vertical still image for this scene, no text in image"}]}\n\n'
+        f"ชื่อตอน: {title}\nบท:\n{script[:6000]}"
+    )
+
+
+def parse_scenes(text):
+    t = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+    a, b = t.find("{"), t.rfind("}")
+    data = json.loads(t[a:b + 1])
+    scenes = []
+    for s in data.get("scenes", [])[:5]:
+        nar, vis = str(s.get("narration", "")).strip(), str(s.get("visual", "")).strip()
+        if nar and vis:
+            scenes.append({"narration": nar[:500], "visual": vis[:600], "audio": "", "image": "", "dur": 0})
+    return scenes
+
+
+def fallback_scenes(plot):
+    parts = [p.strip() for p in re.split(r"[\n.!?।]+", plot) if len(p.strip()) > 8][:4] or [plot[:200]]
+    return [{"narration": p[:300], "visual": f"dramatic cinematic scene illustrating: {p[:200]}",
+             "audio": "", "image": "", "dur": 0} for p in parts]
+
+
+def run_script(job):
+    if not check_quota(job["user"]):
+        return False, "เกินโควตาการเรียก AI ต่อชั่วโมง ลองใหม่ภายหลัง", {}
+    ok, text, model = call_gemini(script_prompt(job["title"], job["genre"], job["plot"]))
+    if not ok:
+        return False, text, {}
+    notes = list(job.get("notes", []))
+    try:
+        ok2, sb, _ = call_gemini(storyboard_prompt(job["title"], text), model=model)
+        scenes = parse_scenes(sb) if ok2 else []
+    except Exception:
+        scenes = []
+    if not scenes:
+        scenes = fallback_scenes(job["plot"])
+        notes.append("แบ่งฉากด้วย AI ไม่สำเร็จ ระบบแบ่งฉากจากพล็อตแทน")
+    return True, "", {"script_text": text, "model": model or "", "scenes": scenes, "notes": notes}
+
+
+def _api_client():
+    if _SDK != "new":
+        raise RuntimeError("ต้องติดตั้งไลบรารี google-genai เพื่อสร้างเสียง/ภาพ")
+    from google.genai import types  # noqa: WPS433
+    return _genai_new.Client(api_key=get_api_key()), types
+
+
+def _save_wav(path, pcm, rate):
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+
+
+def _wav_seconds(path):
+    with wave.open(path, "rb") as w:
+        return w.getnframes() / float(w.getframerate())
+
+
+def run_audio(job):
+    if not check_quota(job["user"]):
+        return False, "เกินโควตาการเรียก AI ต่อชั่วโมง ลองใหม่ภายหลัง", {}
+    client, types = _api_client()
+    key = get_api_key()
+    scenes = [dict(s) for s in job.get("scenes", [])]
+    if not scenes:
+        return False, "ไม่มีฉากให้พากย์ (ลองสร้างบทใหม่)", {}
+    voice = shared_state().get("voice", VOICES[0])
+    models = tts_models()
+    d = job_dir(job["id"])
+    try:
+        for i, sc in enumerate(scenes):
+            last, done = "", False
+            for m in list(models):
+                for _ in range(2):
+                    try:
+                        cfg = types.GenerateContentConfig(
+                            response_modalities=["AUDIO"],
+                            speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))))
+                        resp = client.models.generate_content(
+                            model=m, contents=f"Say in an engaging, dramatic storytelling tone: {sc['narration']}",
+                            config=cfg)
+                        part = resp.candidates[0].content.parts[0].inline_data
+                        mime = part.mime_type or ""
+                        rate = int((re.search(r"rate=(\d+)", mime) or [0, 24000])[1]) if "rate=" in mime else 24000
+                        path = os.path.join(d, f"scene{i + 1}.wav")
+                        _save_wav(path, part.data, rate)
+                        sc["audio"], sc["dur"] = path, round(_wav_seconds(path) + 0.5, 2)
+                        done = True
+                        break
+                    except Exception as e:
+                        last = _clean_err(e, key)
+                        if "429" in last or "quota" in last.lower():
+                            time.sleep(2)
+                            continue
+                        break
+                if done:
+                    break
+            if not done:
+                return False, f"สร้างเสียงฉาก {i + 1} ไม่สำเร็จ: {last}", {}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+    return True, "", {"scenes": scenes}
+
+
+def _fallback_card(path, idx):
+    from PIL import Image, ImageDraw
+    palettes = [((18, 24, 54), (92, 40, 120)), ((40, 16, 24), (150, 52, 60)),
+                ((10, 40, 48), (30, 110, 120)), ((30, 26, 12), (140, 100, 40))]
+    top, bot = palettes[idx % len(palettes)]
+    img = Image.new("RGB", (VIDEO_W, VIDEO_H))
+    dr = ImageDraw.Draw(img)
+    for y in range(VIDEO_H):
+        t = y / VIDEO_H
+        dr.line([(0, y), (VIDEO_W, y)], fill=tuple(int(top[k] + (bot[k] - top[k]) * t) for k in range(3)))
+    img.save(path, "PNG")
+
+
+def run_visual(job):
+    if not check_quota(job["user"]):
+        return False, "เกินโควตาการเรียก AI ต่อชั่วโมง ลองใหม่ภายหลัง", {}
+    client, types = _api_client()
+    key = get_api_key()
+    scenes = [dict(s) for s in job.get("scenes", [])]
+    notes = [n for n in job.get("notes", []) if not n.startswith("ภาพ:")]
+    d = job_dir(job["id"])
+    models = image_models()
+    failed_msgs, fallback_used = [], 0
+    try:
+        for i, sc in enumerate(scenes):
+            prompt = ("Vertical 9:16 cinematic film still, dramatic lighting, rich detail, "
+                      "no text, no captions, no watermark. "
+                      f"Series: {job['title']} (genre: {job['genre']}). Scene: {sc['visual']}")
+            saved = False
+            for m in list(models):
+                try:
+                    if m.startswith("imagen"):
+                        r = client.models.generate_images(
+                            model=m, prompt=prompt,
+                            config=types.GenerateImagesConfig(number_of_images=1, aspect_ratio="9:16"))
+                        data, ext = r.generated_images[0].image.image_bytes, "png"
+                    else:
+                        try:
+                            cfg = types.GenerateContentConfig(response_modalities=["IMAGE"],
+                                                              image_config=types.ImageConfig(aspect_ratio="9:16"))
+                        except Exception:
+                            cfg = types.GenerateContentConfig(response_modalities=["IMAGE"])
+                        r = client.models.generate_content(model=m, contents=prompt, config=cfg)
+                        data, ext = None, "png"
+                        for p in r.candidates[0].content.parts:
+                            inl = getattr(p, "inline_data", None)
+                            if inl and (inl.mime_type or "").startswith("image/"):
+                                data = inl.data
+                                ext = "jpg" if "jpeg" in inl.mime_type else "png"
+                                break
+                        if not data:
+                            raise RuntimeError("โมเดลไม่ส่งภาพกลับมา")
+                    path = os.path.join(d, f"scene{i + 1}.{ext}")
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    sc["image"] = path
+                    saved = True
+                    break
+                except Exception as e:
+                    failed_msgs.append(f"{m}: {_clean_err(e, key)[:120]}")
+                    models.remove(m)  # โมเดลนี้ใช้ไม่ได้ ไม่ต้องลองซ้ำในฉากถัดไป
+            if not saved:
+                path = os.path.join(d, f"scene{i + 1}.png")
+                _fallback_card(path, i)
+                sc["image"] = path
+                fallback_used += 1
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+    if fallback_used:
+        why = failed_msgs[-1] if failed_msgs else "ไม่มีโมเดลสร้างภาพ"
+        notes.append(f"ภาพ: สร้างภาพด้วย AI ไม่ได้ {fallback_used}/{len(scenes)} ฉาก จึงใช้พื้นหลังสำรอง "
+                     f"(มักเพราะบัญชี API ยังไม่เปิดสิทธิ์/โควตาสร้างภาพ) — {why}")
+    return True, "", {"scenes": scenes, "notes": notes}
+
+
+def ffmpeg_exe():
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _run_ff(cmd, timeout=600):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode != 0:
+        raise RuntimeError("ffmpeg ล้มเหลว: " + (p.stderr or "")[-300:].replace("\n", " "))
+
+
+def run_assembly(job):
+    exe = ffmpeg_exe()
+    if not exe:
+        return False, "ไม่พบ ffmpeg — เพิ่ม imageio-ffmpeg ใน requirements.txt (หรือ ffmpeg ใน packages.txt)", {}
+    scenes = job.get("scenes", [])
+    if not scenes or any(not (os.path.exists(s.get("audio", "")) and os.path.exists(s.get("image", ""))) for s in scenes):
+        return False, "ไฟล์เสียง/ภาพไม่ครบ (อาจถูกล้างไปแล้ว) กด \"ลองใหม่\" เพื่อสร้างใหม่", {}
+    d = job_dir(job["id"])
+    segs = []
+    for i, sc in enumerate(scenes):
+        dur = float(sc["dur"]) or (_wav_seconds(sc["audio"]) + 0.5)
+        frames = max(int(dur * VIDEO_FPS), 1)
+        out = os.path.join(d, f"seg{i + 1}.mp4")
+        vf = (f"scale={VIDEO_W * 2}:{VIDEO_H * 2}:force_original_aspect_ratio=increase,"
+              f"crop={VIDEO_W * 2}:{VIDEO_H * 2},"
+              f"zoompan=z='min(zoom+0.0007,1.12)':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+              f":s={VIDEO_W}x{VIDEO_H}:fps={VIDEO_FPS},format=yuv420p")
+        _run_ff([exe, "-y", "-i", sc["image"], "-i", sc["audio"], "-t", f"{dur:.2f}", "-vf", vf,
+                 "-af", "apad", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+                 "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", out])
+        segs.append(out)
+    lst = os.path.join(d, "list.txt")
+    with open(lst, "w", encoding="utf-8") as f:
+        for s in segs:
+            f.write("file '" + os.path.abspath(s).replace("'", "'\\''") + "'\n")
+    final = os.path.join(d, "final.mp4")
+    _run_ff([exe, "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", "-movflags", "+faststart", final])
+    for s in segs:
+        try:
+            os.remove(s)
+        except OSError:
+            pass
+    return True, "", {"output": final}
+
+
+STAGE_RUNNERS = {"script": run_script, "audio": run_audio, "visual": run_visual, "assembly": run_assembly}
+STAGE_TITLE = {"script": "สร้างบท", "audio": "เสียงพากย์", "visual": "ภาพ", "assembly": "ตัดต่อวิดีโอ"}
+
+
+def _stage_thread(job_id, key):
+    """รันหนึ่งขั้นตอนในเธรดเบื้องหลัง (รอดแม้ผู้ใช้กดอะไรในหน้าเว็บ) — ห้ามเรียก st.* ในเธรดนี้"""
+    sem = _global("sem", lambda: threading.Semaphore(MAX_CONCURRENT_STAGES))
+    with sem:
+        def start(jobs):
+            for j in jobs:
+                if j["id"] == job_id:
+                    j["stages"][key]["started"] = time.time()
+                    return dict(j)
+            return None
+
+        job = update_jobs(start)
+        if job is None or job.get("cancelled"):
+            return
+        try:
+            ok, msg, patch = STAGE_RUNNERS[key](job)
+        except Exception as e:  # noqa: BLE001
+            ok, msg, patch = False, f"{type(e).__name__}: {_clean_err(e, get_api_key())}", {}
+
+    def finish(jobs):
+        for j in jobs:
+            if j["id"] == job_id:
+                s = j["stages"][key]
+                if j.get("cancelled"):
+                    s["state"] = "Pending"
+                elif ok:
+                    s["state"], s["finished"] = "Done", time.time()
+                    j.update(patch)
+                    j["error"] = ""
+                else:
+                    s["state"], j["error"] = "Failed", msg
+                recompute(j)
+                return True
+        return False
+
+    if not update_jobs(finish):  # งานถูกลบระหว่างทำ
+        purge_outputs(job_id)
+    log("PIPELINE" if ok else "ERROR",
+        f"{job_id}: {STAGE_TITLE[key]} {'สำเร็จ' if ok else 'ล้มเหลว — ' + msg}", job.get("user"))
 
 
 def worker_tick():
-    """ขยับ pipeline ไปหนึ่งก้าว คืน True ถ้ามีการเปลี่ยนแปลง
-    * บท AI: เรียก Gemini จริง
-    * เสียง/ภาพ/ตัดต่อ: จำลองเวลาประมวลผล (เชื่อม TTS / วิดีโอจริงได้ตรงนี้)"""
+    """ตรวจคิว: เริ่มขั้นตอนถัดไปของแต่ละงาน (เธรดเบื้องหลัง) และกู้ขั้นที่ค้างนานเกินไป
+    คืน True ถ้าสถานะเปลี่ยน"""
     now = time.time()
-    to_run = []
+    to_start = []
     changed = {"v": False}
+    ready = api_ready()
 
     def mutate(jobs):
         for j in jobs:
@@ -507,49 +844,24 @@ def worker_tick():
                 if s["state"] == "Failed":
                     break
                 if s["state"] == "Processing":
-                    if key == "script":
-                        if now - s["started"] > STALE_SECONDS:  # session เดิมหายไประหว่างทำงาน
-                            s["state"] = "Pending"
-                            changed["v"] = True
-                    elif now - s["started"] >= SIM_DURATION[key]:
-                        s["state"], s["finished"] = "Done", now
+                    if now - s["started"] > STALE_SECONDS:  # เธรดหายไป (เช่น เซิร์ฟเวอร์รีสตาร์ต)
+                        s["state"] = "Pending"
                         changed["v"] = True
                     break
                 if s["state"] == "Pending":
-                    if key == "script":
-                        if not api_ready():
-                            j["error"] = "รอการตั้งค่า Gemini API Key จากแอดมิน"
-                            break
-                        j["error"] = ""
-                        to_run.append((j["id"], j["user"], j["title"], j["genre"], j["plot"]))
+                    if key != "assembly" and not ready:
+                        j["error"] = "รอการตั้งค่า Gemini API Key จากแอดมิน"
+                        break
+                    j["error"] = ""
                     s["state"], s["started"] = "Processing", now
+                    to_start.append((j["id"], key))
                     changed["v"] = True
                     break
             recompute(j)
 
     update_jobs(mutate)
-
-    for job_id, user, title, genre, plot in to_run:
-        if not check_quota(user):
-            ok, text, model = False, "เกินโควตาการเรียก AI ต่อชั่วโมง ลองใหม่ภายหลัง", None
-        else:
-            ok, text, model = call_gemini(script_prompt(title, genre, plot))
-
-        def done(jobs, job_id=job_id, ok=ok, text=text, model=model):
-            for j in jobs:
-                if j["id"] == job_id:
-                    s = j["stages"]["script"]
-                    if ok:
-                        s["state"], s["finished"] = "Done", time.time()
-                        j["script_text"], j["model"], j["error"] = text, model or "", ""
-                    else:
-                        s["state"], j["error"] = "Failed", text
-                    recompute(j)
-
-        update_jobs(done)
-        log("PIPELINE" if ok else "ERROR",
-            f"{job_id}: สร้างบท {'สำเร็จ (' + str(model) + ')' if ok else 'ล้มเหลว — ' + text}", user)
-        changed["v"] = True
+    for job_id, key in to_start:
+        threading.Thread(target=_stage_thread, args=(job_id, key), daemon=True).start()
     return changed["v"]
 
 
@@ -656,6 +968,33 @@ def render_job_card(j, scope, show_owner=False):
             elif a[3].button("🗑️ ลบงาน", key=f"{scope}_del_{j['id']}"):
                 st.session_state[ck] = True
                 st.rerun()
+
+        for n in j.get("notes", []):
+            st.info(n)
+
+        out = j.get("output") or ""
+        if j["status"] == "Completed":
+            with st.expander("🎬 วิดีโอที่ผลิตได้", expanded=(scope == "cr")):
+                if out and os.path.exists(out):
+                    st.video(out)
+                    if os.path.getsize(out) < 60 * 1024 * 1024:
+                        with open(out, "rb") as f:
+                            st.download_button("⬇️ ดาวน์โหลดวิดีโอ MP4", f.read(), file_name=f"{j['id']}.mp4",
+                                               mime="video/mp4", key=f"{scope}_mp4_{j['id']}")
+                else:
+                    st.warning("ไฟล์วิดีโอไม่อยู่แล้ว (ดิสก์ของเซิร์ฟเวอร์อาจถูกรีเซ็ต) — สร้างงานใหม่อีกครั้ง")
+
+        scenes = j.get("scenes", [])
+        if scenes:
+            with st.expander(f"🎞️ ฉากและสื่อ ({len(scenes)} ฉาก)"):
+                for i, sc in enumerate(scenes):
+                    c_img, c_txt = st.columns([1, 3])
+                    if sc.get("image") and os.path.exists(sc["image"]):
+                        c_img.image(sc["image"])
+                    c_txt.markdown(f"**ฉาก {i + 1}** · {sc.get('dur') or '-'} วินาที")
+                    c_txt.write(sc.get("narration", ""))
+                    if sc.get("audio") and os.path.exists(sc["audio"]):
+                        c_txt.audio(sc["audio"])
 
         with st.expander("📄 พล็อตและบทที่ AI เขียน"):
             st.caption("พล็อตเรื่อง")
@@ -922,6 +1261,15 @@ def admin_view(jobs):
                 with st.spinner("กำลังทดสอบ..."):
                     ok, text, model = call_gemini("ตอบสั้น ๆ ว่า OK")
                 (st.success if ok else st.error)(f"สำเร็จ ({model}): {text[:60]}" if ok else text)
+            st.markdown("**🎙️ เสียงพากย์ / 🖼️ ภาพ / 🎞️ ตัดต่อ**")
+            v = st.selectbox("เสียงพากย์ (Gemini TTS)", VOICES,
+                             index=VOICES.index(shared_state().get("voice", VOICES[0])))
+            if v != shared_state().get("voice"):
+                shared_state()["voice"] = v
+                log("ADMIN", f"เปลี่ยนเสียงพากย์เป็น {v}", st.session_state.current_user)
+            st.write("ffmpeg: " + ("✅ พร้อม" if ffmpeg_exe() else "❌ ไม่พบ (เพิ่ม imageio-ffmpeg ใน requirements.txt)"))
+            st.caption("โมเดลเสียง: " + ", ".join(tts_models()[:2]))
+            st.caption("โมเดลภาพ: " + ", ".join(image_models()[:2]))
         with c2:
             st.markdown("**💾 ข้อมูลและการสำรอง**")
             st.write(f"โฟลเดอร์ข้อมูล: `{os.path.abspath(DATA_DIR)}`")
@@ -947,7 +1295,10 @@ def admin_view(jobs):
                     st.error("ไฟล์ไม่ถูกต้อง")
             st.markdown("**🧹 ล้างข้อมูล**")
             if st.button("ลบงานที่เสร็จสมบูรณ์ทั้งหมด"):
+                gone = [j["id"] for j in jobs if j["status"] == "Completed"]
                 update_jobs(lambda js: js.__setitem__(slice(None), [j for j in js if j["status"] != "Completed"]))
+                for jid in gone:
+                    purge_outputs(jid)
                 log("ADMIN", "ล้างงานที่เสร็จสมบูรณ์", st.session_state.current_user)
                 st.rerun()
 
