@@ -97,6 +97,7 @@ with st.sidebar:
             st.session_state.gemini_key_input = user_api_key
             try:
                 genai.configure(api_key=user_api_key)
+                # ใช้โมเดลมาตรฐานที่รองรับทั่วไป
                 ai_model = genai.GenerativeModel('gemini-1.5-flash')
                 test_res = ai_model.generate_content("test")
                 if test_res:
@@ -192,7 +193,6 @@ if "Admin" in user_role:
 
     st.divider()
 
-    # ระบบแท็บควบคุมมาตรฐานองค์กร (Tabs Navigation)
     admin_tab1, admin_tab2, admin_tab3 = st.tabs(["📊 Live Pipeline & Queue Monitor", "📈 Analytics & Cloud Insights", "⚙️ System Logs & Health Check"])
 
     with admin_tab1:
