@@ -315,7 +315,16 @@ def call_gemini(prompt, model=None):
         for _ in range(2):
             try:
                 if _SDK == "new":
-                    text = _genai_new.Client(api_key=key).models.generate_content(model=m, contents=prompt).text
+                    # ต้องเก็บ client ไว้ในตัวแปร ไม่เช่นนั้นจะถูกเก็บขยะและปิดการเชื่อมต่อ
+                    # ก่อนส่งคำขอ ("Cannot send a request, as the client has been closed")
+                    client = _genai_new.Client(api_key=key)
+                    try:
+                        text = client.models.generate_content(model=m, contents=prompt).text
+                    finally:
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
                 else:
                     _genai_old.configure(api_key=key)
                     text = _genai_old.GenerativeModel(m).generate_content(prompt).text
