@@ -59,7 +59,8 @@ LOGS_FILE = os.path.join(DATA_DIR, "logs.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 GENRES = ["ดราม่า/แก้แค้น", "โรแมนติก/คอมเมดี้", "แฟนตาซี/ย้อนยุค", "ระทึกขวัญ"]
-MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+# รายชื่อสำรอง ใช้เฉพาะเมื่อถามรายการโมเดลจาก API ไม่ได้ (ปกติระบบค้นหาโมเดลที่ใช้ได้จริงอัตโนมัติ)
+MODEL_CANDIDATES = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro"]
 STAGES = [
     ("script", "1. บท AI"),
     ("audio", "2. เสียงพากย์"),
@@ -116,7 +117,7 @@ def get_lock():
 @st.cache_resource
 def shared_state():
     """หน่วยความจำร่วมทุก session (ไม่เขียนลงดิสก์): API key ที่แอดมินตั้งตอนรัน, โควตา, ตัวนับล็อกอินผิด"""
-    return {"api_key": "", "model": MODEL_CANDIDATES[0], "calls": {}, "fails": {}}
+    return {"api_key": "", "model": "", "calls": {}, "fails": {}}
 
 
 def secret(name, default=""):
@@ -301,6 +302,60 @@ def _clean_err(e, key):
     return msg.replace("\n", " ")[:220]
 
 
+_BAD_MODEL_WORDS = ("lite", "image", "tts", "live", "audio", "embed", "vision", "thinking", "exp",
+                    "robotics", "computer", "gemma", "imagen", "veo", "aqa", "learnlm", "native")
+
+
+def _model_rank(name):
+    """จัดอันดับโมเดลข้อความ: flash ก่อน pro, รุ่นเสถียรก่อน preview; คืน None ถ้าไม่ใช่โมเดลข้อความทั่วไป"""
+    n = name.lower().replace("models/", "")
+    if not n.startswith("gemini") or any(w in n for w in _BAD_MODEL_WORDS):
+        return None
+    preview = "preview" in n
+    if "flash" in n:
+        return 0 if n.endswith("-latest") else (2 if preview else 1)
+    if "pro" in n:
+        return 3 if n.endswith("-latest") else (5 if preview else 4)
+    return None
+
+
+def discover_models(force=False):
+    """ถามรายชื่อโมเดลที่ API Key นี้ใช้ generateContent ได้จริง (แคช 10 นาที)
+    คืนลิสต์เรียงตามความเหมาะสม; ถ้าถามไม่ได้คืนลิสต์ว่าง"""
+    ss = shared_state()
+    key = get_api_key()
+    cache = ss.get("models_cache")
+    if not force and cache and cache["key"] == key and time.time() - cache["ts"] < 600:
+        return cache["models"]
+    names = []
+    if key and _SDK is not None:
+        try:
+            if _SDK == "new":
+                client = _genai_new.Client(api_key=key)
+                try:
+                    for mdl in client.models.list():
+                        acts = getattr(mdl, "supported_actions", None) or []
+                        if not acts or "generateContent" in acts:
+                            names.append(mdl.name)
+                finally:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+            else:
+                _genai_old.configure(api_key=key)
+                for mdl in _genai_old.list_models():
+                    if "generateContent" in getattr(mdl, "supported_generation_methods", []):
+                        names.append(mdl.name)
+        except Exception:
+            names = []
+    ranked = sorted({n.replace("models/", "") for n in names if _model_rank(n) is not None},
+                    key=lambda n: (_model_rank(n), [-ord(c) for c in n]))
+    if ranked:  # ไม่แคชผลว่าง เพื่อให้ลองถามใหม่ครั้งถัดไป
+        ss["models_cache"] = {"key": key, "ts": time.time(), "models": ranked}
+    return ranked
+
+
 def call_gemini(prompt, model=None):
     """คืน (ok, text_or_error, model_used)"""
     key = get_api_key()
@@ -308,9 +363,11 @@ def call_gemini(prompt, model=None):
         return False, "ยังไม่ได้ตั้งค่า Gemini API Key", None
     if _SDK is None:
         return False, "ไม่พบไลบรารี Gemini (ติดตั้ง google-genai)", None
-    preferred = model or shared_state()["model"]
-    models = [preferred] + [m for m in MODEL_CANDIDATES if m != preferred]
-    last = ""
+    preferred = model or shared_state()["model"]  # "" = อัตโนมัติ
+    available = discover_models()
+    pool = available[:6] if available else list(MODEL_CANDIDATES)
+    models = ([preferred] if preferred else []) + [m for m in pool if m != preferred]
+    last, not_found = "", 0
     for m in models:
         for _ in range(2):
             try:
@@ -340,7 +397,13 @@ def call_gemini(prompt, model=None):
                 if "429" in last or "quota" in low or "rate" in low:
                     time.sleep(1.5)
                     continue
+                if "404" in last or "not_found" in low or "not found" in low:
+                    not_found += 1
                 break
+    if not_found and not_found >= len(models):
+        shared_state().pop("models_cache", None)
+        return False, ("ไม่พบโมเดล Gemini ที่ใช้งานได้กับ API Key นี้ (โมเดลอาจถูกยกเลิกแล้ว) "
+                       "ลองกด \"รีเฟรชรายชื่อโมเดล\" ในแท็บระบบ หรือสร้าง API Key ใหม่ที่ aistudio.google.com"), None
     return False, f"เรียก Gemini ไม่สำเร็จ: {last}", None
 
 
@@ -841,11 +904,19 @@ def admin_view(jobs):
             st.markdown("**🤖 Gemini**")
             st.write(f"SDK: `{ {'new': 'google-genai', 'old': 'google-generativeai'}.get(_SDK, 'ไม่พบ') }`")
             st.write("API Key: " + ("✅ ตั้งค่าแล้ว" if get_api_key() else "❌ ยังไม่ตั้งค่า"))
-            sel = st.selectbox("โมเดลหลัก (มี fallback อัตโนมัติ)", MODEL_CANDIDATES,
-                               index=MODEL_CANDIDATES.index(shared_state()["model"])
-                               if shared_state()["model"] in MODEL_CANDIDATES else 0)
-            if sel != shared_state()["model"]:
-                shared_state()["model"] = sel
+            if st.button("🔄 รีเฟรชรายชื่อโมเดล"):
+                discover_models(force=True)
+            avail = discover_models()
+            st.caption(f"โมเดลที่ API Key นี้ใช้ได้: {len(avail)} รายการ" if avail
+                       else "ยังดึงรายชื่อโมเดลไม่ได้ (ตรวจ API Key) — ใช้รายชื่อสำรอง")
+            AUTO = "อัตโนมัติ (แนะนำ)"
+            options = [AUTO] + (avail or MODEL_CANDIDATES)
+            cur = shared_state()["model"] or AUTO
+            sel = st.selectbox("โมเดลหลัก (มี fallback อัตโนมัติ)", options,
+                               index=options.index(cur) if cur in options else 0)
+            new_model = "" if sel == AUTO else sel
+            if new_model != shared_state()["model"]:
+                shared_state()["model"] = new_model
                 log("ADMIN", f"เปลี่ยนโมเดลหลักเป็น {sel}", st.session_state.current_user)
             if st.button("🧪 ทดสอบการเชื่อมต่อ"):
                 with st.spinner("กำลังทดสอบ..."):
